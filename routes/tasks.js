@@ -11,6 +11,11 @@ const formatTask = (t) => ({
   status: t.status,
   dueDate: t.dueDate.toIso8601String ? t.dueDate.toIso8601String() : t.dueDate.toISOString(),
   createdAt: t.createdAt.toISOString(),
+  updates: (t.updates || []).map(u => ({
+    note: u.note,
+    status: u.status,
+    date: u.date ? u.date.toISOString() : new Date().toISOString(),
+  })),
 });
 
 // GET /tasks — all tasks (admin) or by userId (employee)
@@ -42,7 +47,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
     const task = await Task.findByIdAndUpdate(
       req.params.id,
       { title, description, assignedTo, dueDate, status },
-      { new: true },
+      { new: true, runValidators: true },
     );
     if (!task) return res.status(404).json({ error: 'Task not found' });
     res.json(formatTask(task));
@@ -71,6 +76,37 @@ router.delete('/:id', authMiddleware, async (req, res) => {
   try {
     await Task.findByIdAndDelete(req.params.id);
     res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /tasks/:id/updates
+router.get('/:id/updates', authMiddleware, async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    res.json((task.updates || []).map(u => ({
+      note: u.note,
+      status: u.status,
+      date: u.date ? u.date.toISOString() : new Date().toISOString(),
+    })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /tasks/:id/updates — employee submits daily update
+router.post('/:id/updates', authMiddleware, async (req, res) => {
+  try {
+    const { note, status, date } = req.body;
+    const task = await Task.findByIdAndUpdate(
+      req.params.id,
+      { $push: { updates: { $each: [{ note, status, date }], $position: 0 } }, status },
+      { new: true },
+    );
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    res.json(formatTask(task));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -3,6 +3,33 @@ const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const https = require('https');
+
+// Get this from Firebase Console → Project Settings → Cloud Messaging → Server key
+const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY || '';
+
+async function sendFcmPush(fcmToken, title, body) {
+  if (!FCM_SERVER_KEY || !fcmToken) return;
+  const payload = JSON.stringify({
+    to: fcmToken,
+    priority: 'high',
+    notification: { title, body },
+  });
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'fcm.googleapis.com',
+      path: '/fcm/send',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `key=${FCM_SERVER_KEY}`,
+      },
+    }, (res) => { res.resume(); resolve(); });
+    req.on('error', () => resolve());
+    req.write(payload);
+    req.end();
+  });
+}
 
 const app = express();
 app.use(cors());
@@ -175,6 +202,69 @@ app.put('/users/:uid/fcm-token', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── SSE Real-time Task Stream ─────────────────────────────────────────────────
+const sseClients = new Map(); // uid -> res
+
+app.get('/tasks/stream', (req, res) => {
+  const uid = req.query.uid;
+  if (!uid) return res.status(400).end();
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.flushHeaders();
+
+  // Send initial data
+  const sendTasks = async () => {
+    try {
+      const filter = uid === 'admin' ? {} : { assignedTo: uid };
+      const tasks = await db.collection('tasks').find(filter).sort({ createdAt: -1 }).toArray();
+      const data = tasks.map(d => {
+        const json = docToJson(d, 'id');
+        json.updates = (d.updates || []).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 3);
+        return json;
+      });
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) { console.error('SSE error:', e.message); }
+  };
+
+  sendTasks();
+  sseClients.set(uid, res);
+
+  req.on('close', () => {
+    sseClients.delete(uid);
+    res.end();
+  });
+});
+
+function notifyTaskChange(assignedTo) {
+  // Notify the specific employee
+  if (assignedTo && sseClients.has(assignedTo)) {
+    const res = sseClients.get(assignedTo);
+    db.collection('tasks').find({ assignedTo }).sort({ createdAt: -1 }).toArray().then(tasks => {
+      const data = tasks.map(d => {
+        const json = docToJson(d, 'id');
+        json.updates = (d.updates || []).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 3);
+        return json;
+      });
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    }).catch(() => {});
+  }
+  // Notify admin
+  if (sseClients.has('admin')) {
+    const res = sseClients.get('admin');
+    db.collection('tasks').find({}).sort({ createdAt: -1 }).toArray().then(tasks => {
+      const data = tasks.map(d => {
+        const json = docToJson(d, 'id');
+        json.updates = (d.updates || []).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 3);
+        return json;
+      });
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    }).catch(() => {});
+  }
+}
+
 // ── Tasks ─────────────────────────────────────────────────────────────────────
 
 app.get('/tasks', async (req, res) => {
@@ -194,7 +284,40 @@ app.get('/tasks', async (req, res) => {
 app.post('/tasks', async (req, res) => {
   try {
     const result = await db.collection('tasks').insertOne(req.body);
-    res.json({ id: result.insertedId.toString() });
+    const taskId = result.insertedId.toString();
+    const assignedUid = req.body.assignedTo;
+
+    // Notify EMPLOYEE only when task is assigned
+    if (assignedUid) {
+      const oid = toObjectId(assignedUid);
+      const emp = await db.collection('users').findOne(oid ? { _id: oid } : { _id: assignedUid });
+      if (emp) {
+        const title = 'New Task Assigned';
+        const body = `You have been assigned: "${req.body.title}"`;
+        await db.collection('notifications').insertOne({
+          userId: assignedUid, title, body,
+          type: 'received', isRead: false,
+          createdAt: new Date().toISOString(),
+        });
+        if (emp.fcmToken) await sendFcmPush(emp.fcmToken, title, body);
+      }
+    }
+    notifyTaskChange(assignedUid);
+    res.json({ id: taskId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/tasks/:id', async (req, res) => {
+  try {
+    const oid = toObjectId(req.params.id);
+    const query = oid ? { _id: oid } : { _id: req.params.id };
+    const { _id, id, ...fields } = req.body;
+    await db.collection('tasks').updateOne(query, { $set: fields });
+    const updated = await db.collection('tasks').findOne(query);
+    const json = docToJson(updated, 'id');
+    json.updates = (updated.updates || []).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 3);
+    notifyTaskChange(updated.assignedTo);
+    res.json(json);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -202,7 +325,28 @@ app.put('/tasks/:id/status', async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     const query = oid ? { _id: oid } : { _id: req.params.id };
-    await db.collection('tasks').updateOne(query, { $set: { status: req.body.status } });
+    const { status } = req.body;
+    await db.collection('tasks').updateOne(query, { $set: { status } });
+    const task = await db.collection('tasks').findOne(query);
+
+    // When task completed → notify ADMIN only
+    if (status === 'completed' && task) {
+      const admin = await db.collection('users').findOne({ role: 'admin' });
+      if (admin) {
+        const empOid = toObjectId(task.assignedTo);
+        const emp = await db.collection('users').findOne(empOid ? { _id: empOid } : { _id: task.assignedTo });
+        const empName = emp?.name ?? 'An employee';
+        const title = 'Task Completed';
+        const body = `${empName} has completed: "${task.title}"`;
+        await db.collection('notifications').insertOne({
+          userId: admin._id.toString(), title, body,
+          type: 'received', isRead: false,
+          createdAt: new Date().toISOString(),
+        });
+        if (admin.fcmToken) await sendFcmPush(admin.fcmToken, title, body);
+      }
+    }
+    notifyTaskChange(task?.assignedTo);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -226,6 +370,8 @@ app.post('/tasks/:id/updates', async (req, res) => {
       $push: { updates: update },
       $set: { status: req.body.status },
     });
+    const afterUpdate = await db.collection('tasks').findOne(query);
+    notifyTaskChange(afterUpdate?.assignedTo);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -234,7 +380,9 @@ app.delete('/tasks/:id', async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     const query = oid ? { _id: oid } : { _id: req.params.id };
+    const toDelete = await db.collection('tasks').findOne(query);
     await db.collection('tasks').deleteOne(query);
+    notifyTaskChange(toDelete?.assignedTo);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -255,6 +403,82 @@ app.post('/notifications', async (req, res) => {
   try {
     const result = await db.collection('notifications').insertOne(req.body);
     res.json({ id: result.insertedId.toString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/notifications/check-deadlines', async (req, res) => {
+  try {
+    const { uid } = req.body;
+    if (!uid) return res.status(400).json({ error: 'uid required' });
+
+    const tasks = await db.collection('tasks')
+      .find({ assignedTo: uid, status: { $ne: 'completed' } })
+      .toArray();
+
+    const empOid = toObjectId(uid);
+    const emp = await db.collection('users').findOne(empOid ? { _id: empOid } : { _id: uid });
+    const admin = await db.collection('users').findOne({ role: 'admin' });
+
+    const now = new Date();
+    let sent = 0;
+
+    for (const task of tasks) {
+      const due = new Date(task.dueDate);
+      const hoursLeft = (due - now) / (1000 * 60 * 60);
+      const daysLeft = Math.floor(hoursLeft / 24);
+      const isOverdue = due < now;
+      const notifKey = `${task._id}_${isOverdue ? 'overdue' : daysLeft <= 0 ? 'today' : daysLeft === 1 ? 'tomorrow' : 'warning'}`;
+
+      const alreadySent = await db.collection('sentDeadlineNotifs').findOne({ key: notifKey });
+      if (alreadySent) continue;
+
+      let empTitle, empBody, adminTitle, adminBody;
+
+      if (isOverdue) {
+        // OVERDUE → notify BOTH employee and admin
+        empTitle = 'Task Overdue';
+        empBody = `"${task.title}" is past its due date. Please update your status immediately.`;
+        adminTitle = 'Task Overdue Alert';
+        adminBody = `${emp?.name ?? 'An employee'}'s task "${task.title}" is overdue!`;
+      } else if (daysLeft === 0 && hoursLeft <= 24) {
+        // DUE TODAY → employee only
+        empTitle = 'Due Today';
+        empBody = `"${task.title}" is due today. Complete it as soon as possible!`;
+      } else if (daysLeft === 1) {
+        // DUE TOMORROW → employee only
+        empTitle = 'Due Tomorrow';
+        empBody = `"${task.title}" is due tomorrow. Make sure to finish it in time!`;
+      } else if (daysLeft <= 3) {
+        // APPROACHING → employee only
+        empTitle = 'Deadline Approaching';
+        empBody = `"${task.title}" is due in ${daysLeft} days. Stay on track!`;
+      } else {
+        continue;
+      }
+
+      // Notify employee
+      if (emp && empTitle) {
+        await db.collection('notifications').insertOne({
+          userId: uid, title: empTitle, body: empBody,
+          type: 'received', isRead: false, createdAt: new Date().toISOString(),
+        });
+        if (emp.fcmToken) await sendFcmPush(emp.fcmToken, empTitle, empBody);
+      }
+
+      // Notify admin (overdue only)
+      if (admin && adminTitle) {
+        await db.collection('notifications').insertOne({
+          userId: admin._id.toString(), title: adminTitle, body: adminBody,
+          type: 'received', isRead: false, createdAt: new Date().toISOString(),
+        });
+        if (admin.fcmToken) await sendFcmPush(admin.fcmToken, adminTitle, adminBody);
+      }
+
+      await db.collection('sentDeadlineNotifs').insertOne({ key: notifKey, sentAt: new Date() });
+      sent++;
+    }
+
+    res.json({ sent });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
